@@ -1,0 +1,14 @@
+fastmcp>=0.4.1
+google-cloud-bigquery>=3.20.0
+pyjwt[crypto]>=2.8.0
+cryptography>=42.0.0
+sqlglot>=23.0.0
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+pyyaml>=6.0.1
+cachetools>=5.3.3
+uvicorn[standard]>=0.28.0
+starlette>=0.36.0
+httpx>=0.27.0
+python-dotenv>=1.0.1
+requests>=2.32.3
