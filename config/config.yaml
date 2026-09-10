@@ -1,0 +1,74 @@
+# ==============================================================================
+# Server & HTTP Transport Settings
+# ==============================================================================
+server:
+  host: "0.0.0.0"
+  port: 8000
+  endpoint_path: "/mcp"
+  log_level: "INFO"
+
+
+# ==============================================================================
+# Google Cloud Service Account Authentication (Direct Backend Auth)
+# ==============================================================================
+auth:
+  # Path to GCP SA credentials JSON file (relative or absolute).
+  # If null or not found, automatically falls back to GOOGLE_APPLICATION_CREDENTIALS
+  # or Application Default Credentials (ADC) / Workload Identity (for Cloud Run, GKE, VMs).
+  service_account_key_path: "gcp-phoenix-dev.json"
+
+# ==============================================================================
+# BigQuery Execution Guardrails
+# ==============================================================================
+bigquery:
+  project_id: null                       # null auto-detects from the service-account.json
+  location: null                         # null auto-detects location per dataset (e.g. us-east4, asia-south1)
+  default_rows_returned: 50              # Default rows pulled when limit is not specified
+  max_rows_returned: 200                 # Maximum rows serialized to prevent OOM
+  max_bytes_billed: 10737418240          # 10 GB hard cost-ceiling per query
+  query_timeout_seconds: 60
+
+# ==============================================================================
+# SQL Sanitizer (Enforce Read-Only Queries)
+# ==============================================================================
+sanitizer:
+  enabled: true                          # Enforce read-only checks
+  mode: "both"                           # Options: "regex", "ast", "both"
+  blocked_keywords:
+    - "INSERT"
+    - "UPDATE"
+    - "DELETE"
+    - "DROP"
+    - "ALTER"
+    - "TRUNCATE"
+    - "CREATE"
+    - "MERGE"
+    - "GRANT"
+    - "REVOKE"
+    - "EXECUTE"
+    - "CALL"
+
+# ==============================================================================
+# Dynamic Tool Enablement Matrix
+# ==============================================================================
+tools:
+  enable_bq_list_datasets: true
+  enable_bq_list_tables: true
+  enable_bq_table_metadata: true
+  enable_bq_query_execution: true
+
+# ==============================================================================
+# In-Memory Metadata Caching (TTLCache)
+# ==============================================================================
+cache:
+  enabled: true
+  metadata_ttl_seconds: 900              # 15 minutes
+  max_cache_entries: 1024
+
+# ==============================================================================
+# MCP Endpoint Rate Limiting Guardrails
+# ==============================================================================
+rate_limit:
+  enabled: true                          # Enable client rate limiting on MCP endpoint
+  requests_per_minute: 60                # Max requests per sliding window
+  window_seconds: 60                     # Sliding window duration in seconds
