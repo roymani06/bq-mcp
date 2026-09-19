@@ -23,13 +23,14 @@ import pytest
 from google.cloud import bigquery
 from google.cloud.bigquery import QueryJobConfig
 
-from config.settings import BigQueryConfig, Settings, ToolsConfig, load_settings
+from config.settings import BigQueryConfig, SanitizerConfig, Settings, ToolsConfig, load_settings
 from src.client import (
     BigQueryClientManager,
     sanitize_bq_label_key,
     sanitize_bq_label_val,
     sanitize_bq_labels,
 )
+from src.sanitizer import SQLSanitizer
 from src.tools import build_mcp_server
 
 
@@ -198,214 +199,119 @@ class TestBigQueryRequestTags:
 
 
 # ==============================================================================
-# 2. Hybrid Metadata Engine Tests
+# 2. INFORMATION_SCHEMA Restriction & Free REST API Metadata Tests
 # ==============================================================================
 
-class TestHybridMetadataEngine:
-    """Test suite for Hybrid Metadata Engine preferring free REST APIs over INFORMATION_SCHEMA."""
+class TestInformationSchemaRestriction:
+    """Verify queries to INFORMATION_SCHEMA are strictly restricted in the backend."""
 
-    def test_table_search_uses_free_rest_api_without_sql_query(self) -> None:
-        """Searching tables must use free REST API list_tables and never execute BigQuery SQL queries."""
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "SELECT * FROM dataset.INFORMATION_SCHEMA.COLUMNS",
+            "SELECT table_name FROM `project.dataset.INFORMATION_SCHEMA.TABLES`",
+            "SELECT * FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT",
+            "SELECT column_name, data_type FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'users'",
+            "WITH meta AS (SELECT * FROM my_dataset.INFORMATION_SCHEMA.TABLES) SELECT * FROM meta",
+            "SELECT id FROM orders WHERE id IN (SELECT table_name FROM INFORMATION_SCHEMA.TABLES)",
+            "SELECT a.id FROM tbl a JOIN dataset.INFORMATION_SCHEMA.TABLES b ON a.id = b.table_id",
+        ],
+    )
+    def test_information_schema_queries_blocked(self, query: str) -> None:
+        """Any query attempting to access INFORMATION_SCHEMA must be rejected."""
+        sanitizer = SQLSanitizer()
+        with pytest.raises(ValueError) as exc:
+            sanitizer.validate(query)
+        assert "INFORMATION_SCHEMA are restricted" in str(exc.value)
+        assert "bq_list_datasets, bq_list_tables, bq_table_metadata" in str(exc.value)
+
+    def test_information_schema_regex_mode_blocks(self) -> None:
+        """Regex mode alone blocks INFORMATION_SCHEMA."""
+        cfg = SanitizerConfig(enabled=True, mode="regex", restrict_information_schema=True)
+        sanitizer = SQLSanitizer(config=cfg)
+        with pytest.raises(ValueError) as exc:
+            sanitizer.validate("SELECT * FROM dataset.INFORMATION_SCHEMA.TABLES")
+        assert "INFORMATION_SCHEMA are restricted" in str(exc.value)
+
+    def test_information_schema_ast_mode_blocks(self) -> None:
+        """AST mode alone blocks INFORMATION_SCHEMA."""
+        cfg = SanitizerConfig(enabled=True, mode="ast", restrict_information_schema=True)
+        sanitizer = SQLSanitizer(config=cfg)
+        with pytest.raises(ValueError) as exc:
+            sanitizer.validate("SELECT * FROM dataset.INFORMATION_SCHEMA.TABLES")
+        assert "INFORMATION_SCHEMA are restricted" in str(exc.value)
+
+    def test_information_schema_restriction_can_be_disabled(self) -> None:
+        """If restrict_information_schema is set to False, valid read-only queries pass."""
+        cfg = SanitizerConfig(enabled=True, mode="both", restrict_information_schema=False)
+        sanitizer = SQLSanitizer(config=cfg)
+        res = sanitizer.validate("SELECT column_name FROM dataset.INFORMATION_SCHEMA.COLUMNS")
+        assert "INFORMATION_SCHEMA" in res
+
+    def test_execute_query_blocks_information_schema(self) -> None:
+        """Manager execute_query rejects INFORMATION_SCHEMA queries before hitting BigQuery."""
         mock_bq = MagicMock(spec=bigquery.Client)
-        mock_bq.project = "test-project"
+        manager = BigQueryClientManager(client=mock_bq)
 
-        # Mock list_datasets (REST API)
-        mock_ds = MagicMock()
-        mock_ds.dataset_id = "analytics"
-        mock_ds.project = "test-project"
-        mock_ds.full_dataset_id = "test-project:analytics"
-        mock_ds.labels = {}
-        mock_bq.list_datasets.return_value = [mock_ds]
-
-        # Mock list_tables (REST API)
-        mock_t1 = MagicMock()
-        mock_t1.table_id = "orders_daily"
-        mock_t1.project = "test-project"
-        mock_t1.dataset_id = "analytics"
-        mock_t1.table_type = "TABLE"
-        mock_t1.created = None
-        mock_t1.expires = None
-
-        mock_t2 = MagicMock()
-        mock_t2.table_id = "users"
-        mock_t2.project = "test-project"
-        mock_t2.dataset_id = "analytics"
-        mock_t2.table_type = "TABLE"
-        mock_t2.created = None
-        mock_t2.expires = None
-        mock_bq.list_tables.return_value = [mock_t1, mock_t2]
-
-        cfg = BigQueryConfig(project_id="test-project")
-        manager = BigQueryClientManager(config=cfg, client=mock_bq)
-
-        result = manager.search_metadata(query="orders", search_type="tables")
-
-        # Must find orders_daily
-        assert result["total_matches"] == 1
-        assert len(result["tables"]) == 1
-        assert result["tables"][0]["table_id"] == "orders_daily"
-        assert result["tables"][0]["source"] == "rest_api"
-        assert result["bytes_billed"] == 0
-        assert result["engine_used"] == "rest_api"
-
-        # Crucial requirement: mock_bq.query must NOT have been called (0 bytes billed)
+        with pytest.raises(ValueError) as exc:
+            manager.execute_query("SELECT * FROM dataset.INFORMATION_SCHEMA.TABLES")
+        assert "INFORMATION_SCHEMA are restricted" in str(exc.value)
         mock_bq.query.assert_not_called()
 
-    def test_column_search_reserves_information_schema_with_dataset_scoping(self) -> None:
-        """Cross-table column search uses dataset-scoped INFORMATION_SCHEMA with minimal projection."""
-        mock_bq = MagicMock(spec=bigquery.Client)
-        mock_bq.project = "test-project"
-
-        # Mock INFORMATION_SCHEMA query job
-        mock_job = MagicMock()
-        mock_job.total_bytes_billed = 10485760
-        mock_job.cache_hit = False
-
-        class MockInfoRow:
-            def __init__(self, data: dict):
-                self._data = data
-
-            def items(self):
-                return self._data.items()
-
-            def get(self, k, default=None):
-                return self._data.get(k, default)
-
-        mock_job.result.return_value = [
-            MockInfoRow({
-                "table_catalog": "test-project",
-                "table_schema": "sales",
-                "table_name": "orders",
-                "column_name": "order_amount",
-                "data_type": "NUMERIC",
-                "is_nullable": "YES",
-            })
-        ]
-        mock_bq.query.return_value = mock_job
-
-        cfg = BigQueryConfig(
-            project_id="test-project",
-            request_tag_name="bq_mcp_ext",
-            job_labels={"bq_mcp_ext": "true"},
-        )
-        manager = BigQueryClientManager(config=cfg, client=mock_bq)
-
-        result = manager.search_metadata(
-            query="order_amount",
-            dataset_id="sales",
-            search_type="columns",
-            limit=25,
-        )
-
-        assert result["total_matches"] == 1
-        assert len(result["columns"]) == 1
-        col = result["columns"][0]
-        assert col["table_name"] == "orders"
-        assert col["column_name"] == "order_amount"
-        assert col["source"] == "information_schema"
-        assert result["engine_used"] == "information_schema"
-
-        # Verify minimal data scanning guardrails:
-        mock_bq.query.assert_called_once()
-        sql_query = mock_bq.query.call_args[0][0]
-        call_kwargs = mock_bq.query.call_args[1]
-
-        # 1. Dataset-scoped qualification
-        assert "`test-project`.`sales`.INFORMATION_SCHEMA.COLUMNS" in sql_query
-
-        # 2. Minimal column projection (no SELECT *)
-        assert "SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable" in sql_query
-        assert "SELECT *" not in sql_query
-
-        # 3. Parameterized WHERE and LIMIT
-        assert "WHERE LOWER(column_name) LIKE @pattern" in sql_query
-        assert "LIMIT @limit_val" in sql_query
-
-        # 4. Injected job labels
-        job_config = call_kwargs["job_config"]
-        assert job_config.labels["bq_mcp_ext"] == "metadata_search"
-
-    def test_hybrid_search_combines_rest_and_information_schema(self) -> None:
-        """search_type='both' returns matching tables from REST API and matching columns from INFORMATION_SCHEMA."""
+    def test_free_rest_api_metadata_methods_succeed_without_sql(self) -> None:
+        """Free REST APIs (list_datasets, list_tables, get_table_metadata) work without calling client.query."""
         mock_bq = MagicMock(spec=bigquery.Client)
         mock_bq.project = "test-project"
 
         # Mock list_datasets
         mock_ds = MagicMock()
-        mock_ds.dataset_id = "crm"
+        mock_ds.dataset_id = "analytics"
         mock_ds.project = "test-project"
-        mock_ds.full_dataset_id = "test-project:crm"
-        mock_ds.labels = {}
+        mock_ds.full_dataset_id = "test-project:analytics"
+        mock_ds.labels = {"env": "prod"}
         mock_bq.list_datasets.return_value = [mock_ds]
 
-        # Mock list_tables for REST table discovery
+        # Mock list_tables
         mock_tbl = MagicMock()
-        mock_tbl.table_id = "customer_accounts"
+        mock_tbl.table_id = "orders"
         mock_tbl.project = "test-project"
-        mock_tbl.dataset_id = "crm"
+        mock_tbl.dataset_id = "analytics"
         mock_tbl.table_type = "TABLE"
         mock_tbl.created = None
         mock_tbl.expires = None
         mock_bq.list_tables.return_value = [mock_tbl]
 
-        # Mock INFORMATION_SCHEMA query job for column discovery
-        mock_job = MagicMock()
-        mock_job.total_bytes_billed = 5000000
+        # Mock get_table
+        mock_table_obj = MagicMock()
+        mock_table_obj.project = "test-project"
+        mock_table_obj.dataset_id = "analytics"
+        mock_table_obj.table_id = "orders"
+        mock_table_obj.table_type = "TABLE"
+        mock_table_obj.num_rows = 5000
+        mock_table_obj.num_bytes = 1048576
+        mock_table_obj.schema = [bigquery.SchemaField("order_id", "STRING")]
+        mock_table_obj.time_partitioning = None
+        mock_table_obj.range_partitioning = None
+        mock_table_obj.clustering_fields = None
+        mock_table_obj.description = "Orders table"
+        mock_table_obj.created = None
+        mock_table_obj.modified = None
+        mock_table_obj.location = "US"
+        mock_bq.get_table.return_value = mock_table_obj
 
-        class MockRow:
-            def __init__(self, data: dict):
-                self._data = data
+        manager = BigQueryClientManager(client=mock_bq)
 
-            def items(self):
-                return self._data.items()
+        datasets = manager.list_datasets()
+        assert len(datasets) == 1
+        assert datasets[0]["dataset_id"] == "analytics"
 
-            def get(self, k, default=None):
-                return self._data.get(k, default)
+        tables = manager.list_tables("analytics")
+        assert len(tables) == 1
+        assert tables[0]["table_id"] == "orders"
 
-        mock_job.result.return_value = [
-            MockRow({
-                "table_catalog": "test-project",
-                "table_schema": "crm",
-                "table_name": "customer_accounts",
-                "column_name": "customer_id",
-                "data_type": "INT64",
-                "is_nullable": "NO",
-            })
-        ]
-        mock_bq.query.return_value = mock_job
+        meta = manager.get_table_metadata("analytics", "orders")
+        assert meta["num_rows"] == 5000
+        assert meta["schema"][0]["name"] == "order_id"
 
-        cfg = BigQueryConfig(project_id="test-project")
-        manager = BigQueryClientManager(config=cfg, client=mock_bq)
-
-        result = manager.search_metadata(query="customer", search_type="both")
-
-        assert result["total_matches"] == 2
-        assert len(result["tables"]) == 1
-        assert result["tables"][0]["source"] == "rest_api"
-        assert len(result["columns"]) == 1
-        assert result["columns"][0]["source"] == "information_schema"
-        assert result["engine_used"] == "hybrid"
-
-    @pytest.mark.asyncio
-    async def test_bq_search_metadata_tool_invocation(self) -> None:
-        """Test invoking bq_search_metadata via the FastMCP server."""
-        mock_manager = MagicMock(spec=BigQueryClientManager)
-        mock_manager.search_metadata.return_value = {
-            "query": "transactions",
-            "search_type": "tables",
-            "tables": [{"table_id": "transactions_2026", "source": "rest_api"}],
-            "columns": [],
-            "total_matches": 1,
-            "engine_used": "rest_api",
-            "bytes_billed": 0,
-            "job_labels": {"bq_mcp_ext": "true"},
-        }
-
-        settings = Settings(
-            tools=ToolsConfig(enable_bq_search_metadata=True)
-        )
-        server = build_mcp_server(settings=settings, bq_manager=mock_manager)
-
-        res = await server.call_tool("bq_search_metadata", {"query": "transactions"})
-        assert res is not None
-        mock_manager.search_metadata.assert_called_once()
+        # All of these are 100% free REST APIs: mock_bq.query must NOT have been called
+        mock_bq.query.assert_not_called()

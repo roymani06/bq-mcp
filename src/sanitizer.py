@@ -74,7 +74,14 @@ class SQLSanitizer:
         return cleaned_query
 
     def _validate_regex(self, query: str) -> None:
-        """Scan query for blocked SQL keywords."""
+        """Scan query for blocked SQL keywords and restricted schemas."""
+        if getattr(self.config, "restrict_information_schema", True):
+            if re.search(r"\binformation_schema\b", query, re.IGNORECASE):
+                raise ValueError(
+                    "SQL sanitization violation: Direct queries to INFORMATION_SCHEMA are restricted. "
+                    "Please use dedicated BigQuery metadata tools (bq_list_datasets, bq_list_tables, bq_table_metadata) instead."
+                )
+
         if not self._regex_pattern:
             return
 
@@ -111,6 +118,15 @@ class SQLSanitizer:
             raise ValueError(
                 f"SQL sanitization violation: Only SELECT or UNION statements are allowed. Found root statement type: '{root_type}'."
             )
+
+        # Enforce restriction against querying INFORMATION_SCHEMA
+        if getattr(self.config, "restrict_information_schema", True):
+            for table_node in root.find_all(exp.Table):
+                if "information_schema" in table_node.sql().lower():
+                    raise ValueError(
+                        "SQL sanitization violation: Direct queries to INFORMATION_SCHEMA are restricted. "
+                        "Please use dedicated BigQuery metadata tools (bq_list_datasets, bq_list_tables, bq_table_metadata) instead."
+                    )
 
         # Deep search the AST tree for any forbidden mutation / DDL expressions
         mutations = list(root.find_all(FORBIDDEN_EXPRESSIONS))

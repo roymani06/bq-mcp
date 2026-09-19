@@ -182,12 +182,8 @@ def build_mcp_server(
         @mcp.tool(
             name="bq_query_execution",
             description=(
-                "Execute a strictly read-only SQL query on Google Cloud BigQuery. "
-                "Enforces read-only AST and regex checks (blocking INSERT, UPDATE, DELETE, DROP, etc.), "
-                "applies a maximum_bytes_billed cost ceiling, and paginates results to prevent container OOM. "
-                "Set dry_run=True to validate syntax and estimate bytes processed without running or billing. "
-                "Injects configurable job labels and request tags (default: 'bq_mcp_ext'). "
-                "If limit or number of rows is not defined in the tool call or query, defaults to pulling default_rows_returned from config.yaml."
+                "Execute a strictly read-only SQL query on BigQuery with AST safety checks, "
+                "cost limits, dry-run validation, and job labeling."
             ),
         )
         def bq_query_execution(
@@ -223,45 +219,6 @@ def build_mcp_server(
 
     else:
         logger.info("Tool bq_query_execution is disabled in configuration.")
-
-    # -------------------------------------------------------------------------
-    # Tool 5: bq_search_metadata
-    # -------------------------------------------------------------------------
-    if getattr(cfg.tools, "enable_bq_search_metadata", True):
-        logger.info("Registering tool: bq_search_metadata")
-
-        @mcp.tool(
-            name="bq_search_metadata",
-            description=(
-                "Search BigQuery datasets, tables, and column schemas using a hybrid metadata engine. "
-                "Prefers free BigQuery REST APIs for table and dataset discovery (0 bytes billed), "
-                "and reserves dataset-scoped INFORMATION_SCHEMA for targeted column search with minimum data scanning."
-            ),
-        )
-        @cached(prefix="bq_search_metadata", cache_instance=CACHE)
-        def bq_search_metadata(
-            query: str,
-            dataset_id: Optional[str] = None,
-            search_type: str = "both",
-            limit: Optional[int] = None,
-            project_id: Optional[str] = None,
-            request_tag: Optional[str] = None,
-        ) -> Dict[str, Any]:
-            """Search datasets, tables, and columns across BigQuery using hybrid REST/INFORMATION_SCHEMA engine."""
-            try:
-                return manager.search_metadata(
-                    query=query,
-                    dataset_id=dataset_id,
-                    search_type=search_type,
-                    limit=limit,
-                    project_id=project_id,
-                    request_tag=request_tag,
-                )
-            except Exception as exc:
-                raise handle_tool_error("bq_search_metadata", exc) from None
-
-    else:
-        logger.info("Tool bq_search_metadata is disabled in configuration.")
 
     return mcp
 

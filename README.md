@@ -138,6 +138,7 @@ bigquery:
 sanitizer:
   enabled: true                          # Enforce read-only checks
   mode: "both"                           # Options: "regex", "ast", "both"
+  restrict_information_schema: true      # Restrict direct queries to INFORMATION_SCHEMA (enforces free REST API metadata)
   blocked_keywords:
     - "INSERT"
     - "UPDATE"
@@ -158,7 +159,6 @@ tools:
   enable_bq_list_tables: true
   enable_bq_table_metadata: true
   enable_bq_query_execution: true
-  enable_bq_search_metadata: true
 
 # In-Memory Metadata Caching (TTLCache)
 cache:
@@ -405,13 +405,13 @@ In your workspace `.cursor/mcp.json` or IDE MCP settings:
 | `bq_list_tables` | `dataset_id: str`, `project_id?: str` | Lists tables, views, and materialized views via free REST API ($0.00). Cached in TTLCache. |
 | `bq_table_metadata`| `dataset_id: str`, `table_id: str`, `project_id?: str` | Returns column schema, row counts, storage size, partition details, and clustering keys via free REST API ($0.00). Cached in TTLCache. |
 | `bq_query_execution`| `query: str`, `dry_run?: bool`, `limit?: int`, `request_tag?: str` | Executes read-only SQL queries with AST validation, `max_bytes_billed` billing cap, pagination, and injected job labels (`bq_mcp_ext`). |
-| `bq_search_metadata`| `query: str`, `dataset_id?: str`, `search_type?: str`, `limit?: int`, `project_id?: str` | Hybrid metadata search preferring free BigQuery REST APIs ($0.00) for tables and reserving dataset-scoped `INFORMATION_SCHEMA` for targeted column search. Cached in TTLCache. |
 
 ---
 
 ## Security Guardrails
 
 - **AST Mutation Blocking**: Uses `sqlglot` to parse the BigQuery abstract syntax tree. Disallows query chaining (`;`), stored procedure executions (`CALL`), table drops (`DROP`), and data mutations (`INSERT`, `UPDATE`, `DELETE`, `MERGE`), including those obscured within CTEs or subqueries.
+- **INFORMATION_SCHEMA Restriction**: Blocks queries accessing `INFORMATION_SCHEMA` in `bq_query_execution` via regex and AST checks, enforcing the use of free BigQuery REST API metadata endpoints.
 - **Cost Ceilings (`maximum_bytes_billed`)**: Protects against unexpected high-cost queries by enforcing a hard upper bound on bytes scanned.
 - **Container Memory Safeguards**: Automatically sets `max_results` on BigQuery result iteration to prevent container memory exhaustion and out-of-memory crashes.
 - **Principle of Least Privilege**: Inbound client auth verifies Entra ID identity, while BigQuery machine-to-machine auth is locked down via Google Cloud IAM.

@@ -372,7 +372,6 @@ class TestDynamicToolRegistration:
                 enable_bq_list_tables=True,
                 enable_bq_table_metadata=True,
                 enable_bq_query_execution=True,
-                enable_bq_search_metadata=True,
             )
         )
         server = build_mcp_server(settings=settings)
@@ -383,7 +382,6 @@ class TestDynamicToolRegistration:
             "bq_list_tables",
             "bq_table_metadata",
             "bq_query_execution",
-            "bq_search_metadata",
         }
 
     @pytest.mark.asyncio
@@ -394,7 +392,6 @@ class TestDynamicToolRegistration:
                 enable_bq_list_tables=False,
                 enable_bq_table_metadata=False,
                 enable_bq_query_execution=True,
-                enable_bq_search_metadata=False,
             )
         )
         server = build_mcp_server(settings=settings)
@@ -403,7 +400,6 @@ class TestDynamicToolRegistration:
         assert names == {"bq_list_datasets", "bq_query_execution"}
         assert "bq_list_tables" not in names
         assert "bq_table_metadata" not in names
-        assert "bq_search_metadata" not in names
 
 
 # ==============================================================================

@@ -81,7 +81,7 @@ flowchart TD
 ---
 
 ### 2.2. `src/tools.py` — Dynamic FastMCP Tool Registry & Error Shielding
-- **Purpose**: Defines the 5 public MCP tools exposed to AI models and coordinates error masking to prevent security leaks.
+- **Purpose**: Defines the 4 public MCP tools exposed to AI models and coordinates error masking to prevent security leaks.
 - **Key Components**:
   - `_sanitize_message(raw: str) -> str`:
     - Regex engine that scrubs Google Cloud internal REST endpoints (`https://bigquery.googleapis.com/...`), local credential filesystem paths, internal Job IDs, and server stack traces from error messages.
@@ -95,13 +95,12 @@ flowchart TD
       1. **`bq_list_datasets`**: Lists available BigQuery datasets in the target GCP project using free REST API. (Cached with TTLCache).
       2. **`bq_list_tables`**: Lists all tables, views, and materialized views inside a dataset using free REST API. (Cached with TTLCache).
       3. **`bq_table_metadata`**: Retrieves schema (column types, modes, descriptions), row count, byte size, partitioning, and clustering keys via free REST API. (Cached with TTLCache).
-      4. **`bq_query_execution`**: Executes strictly read-only SQL with pagination, cost ceilings, job label injection (`bq_mcp_ext`), and optional `dry_run` cost estimation.
-      5. **`bq_search_metadata`**: Hybrid metadata search tool preferring free BigQuery REST APIs for table and dataset discovery ($0.00 / 0 query bytes), and reserving dataset-scoped `INFORMATION_SCHEMA` strictly for cross-table column search with minimal data scanning. (Cached with TTLCache).
+      4. **`bq_query_execution`**: Executes strictly read-only SQL with pagination, cost ceilings, job label injection (`bq_mcp_ext`), and optional `dry_run` cost estimation. Restricts direct `INFORMATION_SCHEMA` queries to protect against unnecessary scanning costs.
 
 ---
 
 ### 2.3. `src/client.py` — BigQuery Backend Client & Guardrails Engine
-- **Purpose**: Directly interfaces with Google Cloud BigQuery, enforcing cost limits, request tag injection, SQL limit injection, hybrid metadata queries, and JSON data type serialization.
+- **Purpose**: Directly interfaces with Google Cloud BigQuery, enforcing cost limits, request tag injection, SQL limit injection, free REST metadata retrieval, and JSON data type serialization.
 - **Key Components**:
   - `BigQueryClientManager`:
     - Thread-safe lazy-initialization of `google.cloud.bigquery.Client`.
@@ -114,13 +113,10 @@ flowchart TD
         - Injects configurable job labels into `QueryJobConfig.labels` from `config.yaml` and request context.
         - Manages request tag name via `config.request_tag_name` (default: `'bq_mcp_ext'`).
         - Sanitizes keys and values to strictly satisfy GCP BigQuery requirements (`[a-z0-9_-]`, max 63 characters).
-    - **Hybrid Metadata Engine**:
-      - `list_datasets()`, `list_tables()`, `get_table_metadata()`: 100% free BigQuery REST APIs ($0.00 / 0 query bytes).
-      - `search_metadata(query, dataset_id, search_type, limit)`:
-        - **Free REST API Phase**: Discovers datasets and tables in memory via `list_datasets()` and `list_tables()` without executing any BigQuery SQL queries (0 bytes billed).
-        - **Scoped INFORMATION_SCHEMA Phase**: Strictly reserved for cross-table column search. Scopes directly to `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS` (never region/project-wide), projects only required columns (`table_catalog`, `table_schema`, `table_name`, `column_name`, `data_type`, `is_nullable`), pushes down parameterized filters, enforces SQL `LIMIT`, and injects job labels (`bq_mcp_ext`).
+    - **Zero-Cost Metadata Engine**:
+      - `list_datasets()`, `list_tables()`, `get_table_metadata()`: Exclusively uses 100% free BigQuery REST APIs ($0.00 / 0 query bytes).
     - `execute_query(query, dry_run, limit, request_context, request_tag)`:
-      - Validates query against `SANITIZER`.
+      - Validates query against `SANITIZER` (enforcing read-only operations and restricting `INFORMATION_SCHEMA`).
       - Resolves effective row limit based on hierarchy: explicit tool argument `limit` → query's `LIMIT` clause → `default_rows_returned` (capped at `max_rows_returned`).
       - Injects top-level `LIMIT <n>` server-side for live queries missing a limit to protect TB-scale tables from full-table materialization.
       - Sets `QueryJobConfig(maximum_bytes_billed=..., dry_run=..., use_query_cache=True, labels=effective_labels)`.
@@ -141,15 +137,18 @@ flowchart TD
 ---
 
 ### 2.4. `src/sanitizer.py` — Read-Only SQL Sanitizer & Guardrails
-- **Purpose**: Guarantees zero write, update, or DDL operations on BigQuery via layered AST and keyword validation.
+- **Purpose**: Guarantees zero write, update, or DDL operations on BigQuery via layered AST and keyword validation, and restricts expensive direct `INFORMATION_SCHEMA` scans.
 - **Key Components**:
   - `SQLSanitizer`:
     - Supports three operational modes: `"regex"`, `"ast"`, and `"both"` (default).
-    - `_validate_regex()`: Scans query text against configured forbidden keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, `MERGE`, `GRANT`, `REVOKE`, `EXECUTE`, `CALL`) with case-insensitive word-boundary matching (`\b`).
+    - `_validate_regex()`:
+      - Enforces `restrict_information_schema: true` by blocking queries containing `\bINFORMATION_SCHEMA\b` and instructing callers to use free REST API metadata tools (`bq_list_datasets`, `bq_list_tables`, `bq_table_metadata`).
+      - Scans query text against configured forbidden keywords (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, `MERGE`, `GRANT`, `REVOKE`, `EXECUTE`, `CALL`) with case-insensitive word-boundary matching (`\b`).
     - `_validate_ast()`:
       - Parses SQL using `sqlglot` under the `bigquery` dialect.
       - Enforces that multi-statement queries (e.g., `SELECT 1; DROP TABLE users;`) are blocked to prevent query chaining.
       - Enforces that the root AST expression is strictly a `Select` or `Union` query.
+      - Inspects all AST table references (`root.find_all(exp.Table)`) to block any queries attempting to access `INFORMATION_SCHEMA`.
       - Recursively traverses AST nodes (`root.find_all(...)`) to verify no mutation or DDL statements exist anywhere in the syntax tree.
 
 ---

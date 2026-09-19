@@ -88,6 +88,10 @@ class SanitizerConfig(BaseModel):
         default="both",
         description="Sanitizer mode: 'regex', 'ast', or 'both'"
     )
+    restrict_information_schema: bool = Field(
+        default=True,
+        description="Whether to restrict direct queries to INFORMATION_SCHEMA"
+    )
     blocked_keywords: List[str] = Field(
         default_factory=lambda: [
             "INSERT",
@@ -113,7 +117,6 @@ class ToolsConfig(BaseModel):
     enable_bq_list_tables: bool = Field(default=True, description="Enable bq_list_tables tool")
     enable_bq_table_metadata: bool = Field(default=True, description="Enable bq_table_metadata tool")
     enable_bq_query_execution: bool = Field(default=True, description="Enable bq_query_execution tool")
-    enable_bq_search_metadata: bool = Field(default=True, description="Enable bq_search_metadata tool")
 
 
 class CacheConfig(BaseModel):
@@ -274,6 +277,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         data["sanitizer"]["enabled"] = os.environ["SANITIZER_ENABLED"].lower() in ("true", "1", "yes")
     if "SANITIZER_MODE" in os.environ:
         data["sanitizer"]["mode"] = os.environ["SANITIZER_MODE"]
+    if "SANITIZER_RESTRICT_INFORMATION_SCHEMA" in os.environ:
+        data["sanitizer"]["restrict_information_schema"] = os.environ["SANITIZER_RESTRICT_INFORMATION_SCHEMA"].lower() in ("true", "1", "yes")
 
     # Tools enablement overrides
     if "tools" not in data:
@@ -286,8 +291,6 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         data["tools"]["enable_bq_table_metadata"] = os.environ["ENABLE_BQ_TABLE_METADATA"].lower() in ("true", "1", "yes")
     if "ENABLE_BQ_QUERY_EXECUTION" in os.environ:
         data["tools"]["enable_bq_query_execution"] = os.environ["ENABLE_BQ_QUERY_EXECUTION"].lower() in ("true", "1", "yes")
-    if "ENABLE_BQ_SEARCH_METADATA" in os.environ:
-        data["tools"]["enable_bq_search_metadata"] = os.environ["ENABLE_BQ_SEARCH_METADATA"].lower() in ("true", "1", "yes")
 
     return data
 

@@ -33,11 +33,12 @@ bigquery:
     bq_mcp_ext: "true"
 
 # ==============================================================================
-# SQL Sanitizer (Enforce Read-Only Queries)
+# SQL Sanitizer (Enforce Read-Only Queries & Restrict INFORMATION_SCHEMA)
 # ==============================================================================
 sanitizer:
   enabled: true                          # Enforce read-only checks
   mode: "both"                           # Options: "regex", "ast", "both"
+  restrict_information_schema: true      # Restrict direct queries to INFORMATION_SCHEMA (prefer free REST metadata tools)
   blocked_keywords:
     - "INSERT"
     - "UPDATE"
@@ -60,7 +61,6 @@ tools:
   enable_bq_list_tables: true
   enable_bq_table_metadata: true
   enable_bq_query_execution: true
-  enable_bq_search_metadata: true
 
 # ==============================================================================
 # In-Memory Metadata Caching (TTLCache)
