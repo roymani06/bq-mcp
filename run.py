@@ -59,6 +59,7 @@ def print_banner(host: str, port: int) -> None:
         f"  • Healthcheck:     http://{display_host}:{port}/health\n"
         f"  • Rate Limiting:   {SETTINGS.rate_limit.enabled} ({SETTINGS.rate_limit.requests_per_minute} req/{SETTINGS.rate_limit.window_seconds}s)\n"
         f"  • Cost Ceiling:    {SETTINGS.bigquery.max_bytes_billed / (1024**3):.1f} GB per query\n"
+        f"  • Request Tag:     {SETTINGS.bigquery.request_tag_name} (Job Labels: {len(SETTINGS.bigquery.job_labels)})\n"
         "=" * 70 + "\n"
         "  Press CTRL+C to stop the server\n"
     )

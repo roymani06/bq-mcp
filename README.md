@@ -129,6 +129,10 @@ bigquery:
   max_rows_returned: 200                 # Maximum rows serialized to prevent OOM
   max_bytes_billed: 10737418240          # 10 GB hard cost-ceiling per query
   query_timeout_seconds: 60
+  # BigQuery Request Tags & Job Labels
+  request_tag_name: "bq_mcp_ext"         # Tag name for tracking jobs in BigQuery
+  job_labels:                            # Configurable static job labels injected into BigQuery jobs
+    bq_mcp_ext: "true"
 
 # SQL Sanitizer (Enforce Read-Only Queries)
 sanitizer:
@@ -154,6 +158,7 @@ tools:
   enable_bq_list_tables: true
   enable_bq_table_metadata: true
   enable_bq_query_execution: true
+  enable_bq_search_metadata: true
 
 # In-Memory Metadata Caching (TTLCache)
 cache:
@@ -396,10 +401,11 @@ In your workspace `.cursor/mcp.json` or IDE MCP settings:
 
 | Tool | Parameters | Description |
 | :--- | :--- | :--- |
-| `bq_list_datasets` | `project_id?: str` | Lists BigQuery datasets with identifiers and labels. Cached in TTLCache. |
-| `bq_list_tables` | `dataset_id: str`, `project_id?: str` | Lists tables, views, and materialized views. Cached in TTLCache. |
-| `bq_table_metadata`| `dataset_id: str`, `table_id: str`, `project_id?: str` | Returns column schema, row counts, storage size, partition details, and clustering keys. Cached in TTLCache. |
-| `bq_query_execution`| `query: str`, `dry_run?: bool`, `limit?: int` | Executes read-only SQL queries with AST validation, `max_bytes_billed` billing cap, and pagination. |
+| `bq_list_datasets` | `project_id?: str` | Lists BigQuery datasets with identifiers and labels via free REST API ($0.00). Cached in TTLCache. |
+| `bq_list_tables` | `dataset_id: str`, `project_id?: str` | Lists tables, views, and materialized views via free REST API ($0.00). Cached in TTLCache. |
+| `bq_table_metadata`| `dataset_id: str`, `table_id: str`, `project_id?: str` | Returns column schema, row counts, storage size, partition details, and clustering keys via free REST API ($0.00). Cached in TTLCache. |
+| `bq_query_execution`| `query: str`, `dry_run?: bool`, `limit?: int`, `request_tag?: str` | Executes read-only SQL queries with AST validation, `max_bytes_billed` billing cap, pagination, and injected job labels (`bq_mcp_ext`). |
+| `bq_search_metadata`| `query: str`, `dataset_id?: str`, `search_type?: str`, `limit?: int`, `project_id?: str` | Hybrid metadata search preferring free BigQuery REST APIs ($0.00) for tables and reserving dataset-scoped `INFORMATION_SCHEMA` for targeted column search. Cached in TTLCache. |
 
 ---
 

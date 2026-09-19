@@ -8,6 +8,7 @@ import datetime
 import decimal
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,45 @@ from config.settings import SETTINGS, BigQueryConfig
 from src.sanitizer import SANITIZER
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_bq_label_key(key: str) -> str:
+    """Sanitize and format a string into a valid BigQuery job label key.
+
+    GCP BigQuery label key constraints:
+    - Must be 1 to 63 characters long.
+    - Must start with a lowercase letter or international character.
+    - Can only contain lowercase letters, numeric characters, underscores (_), and hyphens (-).
+    """
+    k = str(key).lower().strip()
+    k = re.sub(r"[^a-z0-9_-]", "_", k)
+    if not k or not (k[0].isalpha() and k[0].isascii()):
+        k = f"k_{k}"
+    return k[:63]
+
+
+def sanitize_bq_label_val(val: Any) -> str:
+    """Sanitize and format a value into a valid BigQuery job label value.
+
+    GCP BigQuery label value constraints:
+    - Up to 63 characters long.
+    - Can only contain lowercase letters, numeric characters, underscores (_), and hyphens (-).
+    """
+    if val is None:
+        return ""
+    v = str(val).lower().strip()
+    v = re.sub(r"[^a-z0-9_-]", "_", v)
+    return v[:63]
+
+
+def sanitize_bq_labels(labels: Dict[str, Any]) -> Dict[str, str]:
+    """Sanitize a dictionary of key-value pairs into valid BigQuery job labels."""
+    sanitized: Dict[str, str] = {}
+    for k, v in labels.items():
+        sk = sanitize_bq_label_key(k)
+        sv = sanitize_bq_label_val(v)
+        sanitized[sk] = sv
+    return sanitized
 
 
 def extract_sql_limit(query: str) -> Optional[int]:
@@ -246,21 +286,228 @@ class BigQueryClientManager:
             "location": table.location,
         }
 
+    def build_job_labels(
+        self,
+        request_context: Optional[Dict[str, Any] | str] = None,
+        request_tag: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Construct validated BigQuery QueryJobConfig.labels from config.yaml and request context.
+
+        Combines:
+        1. Configured static labels from config.yaml (`config.job_labels`).
+        2. Configurable request tag (key managed via `config.request_tag_name`, default 'bq_mcp_ext').
+        3. Dynamic request context (request_id, client_id, caller tag).
+        """
+        raw_labels: Dict[str, Any] = {}
+
+        # 1. Base labels from config.yaml
+        if getattr(self.config, "job_labels", None):
+            raw_labels.update(self.config.job_labels)
+
+        # 2. Configurable request tag name (default 'bq_mcp_ext')
+        tag_key = getattr(self.config, "request_tag_name", "bq_mcp_ext") or "bq_mcp_ext"
+
+        # Priority for tag value: explicit request_tag > request_context (if string) > existing config label > "true"
+        if request_tag:
+            raw_labels[tag_key] = request_tag
+        elif isinstance(request_context, str) and request_context.strip():
+            raw_labels[tag_key] = request_context.strip()
+        elif tag_key not in raw_labels:
+            raw_labels[tag_key] = "true"
+
+        # 3. Dynamic request context dictionary (e.g. request_id, client, trace)
+        if isinstance(request_context, dict):
+            for ck, cv in request_context.items():
+                raw_labels[ck] = cv
+
+        # Sanitize and cap to GCP BigQuery maximum limit of 64 labels per job
+        sanitized = sanitize_bq_labels(raw_labels)
+        if len(sanitized) > 64:
+            sanitized = dict(list(sanitized.items())[:64])
+        return sanitized
+
+    def search_metadata(
+        self,
+        query: str,
+        dataset_id: Optional[str] = None,
+        search_type: str = "both",
+        limit: Optional[int] = None,
+        project_id: Optional[str] = None,
+        request_tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Hybrid metadata engine search preferring free BigQuery REST APIs over INFORMATION_SCHEMA.
+
+        Architecture & Cost Strategy:
+        1. Free BigQuery REST APIs ($0.00 / 0 bytes billed):
+           - Table & dataset discovery uses `client.list_datasets()` and `client.list_tables()`.
+           - In-memory matching on table names and descriptions.
+        2. Scoped INFORMATION_SCHEMA (Strictly reserved for cross-table column search):
+           - Avoids full-project/region scans by scoping directly to dataset-level: `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`.
+           - Selects minimal columns: table_catalog, table_schema, table_name, column_name, data_type, is_nullable.
+           - Enforces parameterized WHERE filter with SQL LIMIT to scan minimum data.
+           - Attaches BigQuery job labels including `request_tag_name` ('bq_mcp_ext').
+        """
+        target_project = project_id or self.config.project_id or self.client.project
+        clean_query = query.strip()
+        if not clean_query:
+            return {
+                "query": query,
+                "search_type": search_type,
+                "dataset_id": dataset_id,
+                "tables": [],
+                "columns": [],
+                "total_matches": 0,
+                "engine_used": "rest_api",
+                "bytes_billed": 0,
+                "job_labels": self.build_job_labels(request_tag=request_tag),
+            }
+
+        effective_limit = min(
+            limit or self.config.default_rows_returned,
+            self.config.max_rows_returned,
+        )
+        query_pattern = clean_query.lower()
+        matching_tables: List[Dict[str, Any]] = []
+        matching_columns: List[Dict[str, Any]] = []
+        bytes_billed = 0
+        engine_used = "rest_api"
+
+        # -----------------------------------------------------------------
+        # Step 1: Free BigQuery REST APIs (Table & Dataset Discovery)
+        # Cost: $0.00 / 0 bytes billed
+        # -----------------------------------------------------------------
+        if search_type in ("tables", "both"):
+            try:
+                datasets_to_check = [dataset_id] if dataset_id else [
+                    d["dataset_id"] for d in self.list_datasets(project_id=target_project)
+                ]
+                for ds in datasets_to_check:
+                    try:
+                        tables = self.list_tables(dataset_id=ds, project_id=target_project)
+                        for tbl in tables:
+                            t_id = tbl.get("table_id", "")
+                            if query_pattern in t_id.lower():
+                                matching_tables.append({
+                                    "project": target_project,
+                                    "dataset_id": ds,
+                                    "table_id": t_id,
+                                    "table_type": tbl.get("table_type"),
+                                    "full_table_id": f"{target_project}.{ds}.{t_id}",
+                                    "match_type": "table_name",
+                                    "source": "rest_api",
+                                })
+                                if len(matching_tables) >= effective_limit:
+                                    break
+                    except Exception as ds_exc:
+                        logger.warning("Error listing tables in dataset %s: %s", ds, ds_exc)
+                    if len(matching_tables) >= effective_limit:
+                        break
+            except Exception as exc:
+                logger.warning("Error during REST API table search: %s", exc)
+
+        # -----------------------------------------------------------------
+        # Step 2: Reserving INFORMATION_SCHEMA strictly for Column Search
+        # Minimum Data Scanning Guardrails:
+        # - Dataset-scoped qualification `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+        # - Project ONLY necessary columns (avoid SELECT *)
+        # - Parameterized WHERE clause and strict LIMIT
+        # - Injected request labels (bq_mcp_ext)
+        # -----------------------------------------------------------------
+        if search_type in ("columns", "both") and len(matching_columns) < effective_limit:
+            datasets_to_scan = [dataset_id] if dataset_id else [
+                d["dataset_id"] for d in self.list_datasets(project_id=target_project)
+            ]
+
+            labels = self.build_job_labels(request_tag=request_tag or "metadata_search")
+            remaining_limit = effective_limit - len(matching_columns)
+
+            for ds in datasets_to_scan:
+                if remaining_limit <= 0:
+                    break
+                if not re.match(r"^[a-zA-Z0-9_-]+$", ds):
+                    continue
+
+                engine_used = "hybrid" if matching_tables else "information_schema"
+
+                # Minimally scoped query: ONLY required columns, dataset-scoped, parameterized, strict limit
+                info_schema_sql = (
+                    f"SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable "
+                    f"FROM `{target_project}`.`{ds}`.INFORMATION_SCHEMA.COLUMNS "
+                    f"WHERE LOWER(column_name) LIKE @pattern "
+                    f"LIMIT @limit_val"
+                )
+
+                job_config = QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("pattern", "STRING", f"%{query_pattern}%"),
+                        bigquery.ScalarQueryParameter("limit_val", "INT64", remaining_limit),
+                    ],
+                    maximum_bytes_billed=self.config.max_bytes_billed,
+                    labels=labels,
+                    use_query_cache=True,
+                )
+
+                try:
+                    logger.info("Executing dataset-scoped INFORMATION_SCHEMA query on %s.%s", target_project, ds)
+                    query_job = self.client.query(
+                        info_schema_sql,
+                        job_config=job_config,
+                        location=self.config.location,
+                    )
+                    results = query_job.result(max_results=remaining_limit, timeout=self.config.query_timeout_seconds)
+                    if query_job.total_bytes_billed:
+                        bytes_billed += query_job.total_bytes_billed
+
+                    for row in results:
+                        r_dict = dict(row.items()) if hasattr(row, "items") else {}
+                        tbl_name = r_dict.get("table_name")
+                        matching_columns.append({
+                            "project": r_dict.get("table_catalog") or target_project,
+                            "dataset_id": r_dict.get("table_schema") or ds,
+                            "table_id": tbl_name,
+                            "table_name": tbl_name,
+                            "column_name": r_dict.get("column_name"),
+                            "data_type": r_dict.get("data_type"),
+                            "is_nullable": r_dict.get("is_nullable"),
+                            "source": "information_schema",
+                        })
+                        remaining_limit -= 1
+                        if remaining_limit <= 0:
+                            break
+                except Exception as info_exc:
+                    logger.warning("INFORMATION_SCHEMA search failed on %s.%s: %s", target_project, ds, info_exc)
+
+        return {
+            "query": clean_query,
+            "search_type": search_type,
+            "dataset_id": dataset_id,
+            "tables": matching_tables,
+            "columns": matching_columns,
+            "total_matches": len(matching_tables) + len(matching_columns),
+            "engine_used": engine_used,
+            "bytes_billed": bytes_billed,
+            "job_labels": self.build_job_labels(request_tag=request_tag),
+        }
+
     def execute_query(
         self,
         query: str,
         dry_run: bool = False,
         limit: Optional[int] = None,
+        request_context: Optional[Dict[str, Any] | str] = None,
+        request_tag: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Execute a read-only SQL query with billing safeguards and pagination.
+        """Execute a read-only SQL query with billing safeguards, pagination, and request labels.
 
         Args:
             query: The SQL query string.
             dry_run: If True, returns query cost estimates without execution.
             limit: Custom maximum row limit (capped by config.max_rows_returned).
+            request_context: Dynamic request context or dict of caller attributes.
+            request_tag: Custom request tag value for the configured request_tag_name ('bq_mcp_ext').
 
         Returns:
-            Dictionary with query results, stats, and schema.
+            Dictionary with query results, stats, schema, and applied job labels.
         """
         # Enforce read-only SQL sanitizer
         sanitized_query = SANITIZER.validate(query)
@@ -283,24 +530,33 @@ class BigQueryClientManager:
         if not dry_run and query_limit is None:
             execution_query = inject_sql_limit(sanitized_query, effective_limit)
 
-        # Configure QueryJobConfig with hard cost ceiling and dry-run flag
+        # Construct and validate BigQuery job labels including request tag
+        effective_labels = self.build_job_labels(
+            request_context=request_context,
+            request_tag=request_tag,
+        )
+
+        # Configure QueryJobConfig with hard cost ceiling, dry-run flag, and request labels
         job_config = QueryJobConfig(
             maximum_bytes_billed=self.config.max_bytes_billed,
             dry_run=dry_run,
             use_query_cache=True,
+            labels=effective_labels,
         )
 
         if dry_run:
             logger.info(
-                "Submitting BigQuery query (dry_run=True, max_bytes_billed=%d): %s",
+                "Submitting BigQuery query (dry_run=True, max_bytes_billed=%d, labels=%s): %s",
                 self.config.max_bytes_billed,
+                effective_labels,
                 execution_query[:200],
             )
         else:
             logger.info(
-                "Submitting BigQuery query (dry_run=False, max_bytes_billed=%d, effective_limit=%d): %s",
+                "Submitting BigQuery query (dry_run=False, max_bytes_billed=%d, effective_limit=%d, labels=%s): %s",
                 self.config.max_bytes_billed,
                 effective_limit,
+                effective_labels,
                 execution_query[:200],
             )
 
@@ -326,6 +582,7 @@ class BigQueryClientManager:
                 "cache_hit": query_job.cache_hit,
                 "schema": schema,
                 "execution_time_ms": duration_ms,
+                "job_labels": effective_labels,
             }
 
         logger.debug("Fetching up to %d rows with timeout=%ds", effective_limit, self.config.query_timeout_seconds)
@@ -368,6 +625,7 @@ class BigQueryClientManager:
             "cache_hit": query_job.cache_hit,
             "execution_time_ms": duration_ms,
             "schema": schema,
+            "job_labels": effective_labels,
         }
 
 

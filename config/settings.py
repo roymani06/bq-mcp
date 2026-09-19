@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -62,6 +62,14 @@ class BigQueryConfig(BaseModel):
         default=60, ge=1,
         description="Timeout in seconds for BigQuery query execution"
     )
+    request_tag_name: str = Field(
+        default="bq_mcp_ext",
+        description="BigQuery job label key used for request tagging (managed via config.yaml)",
+    )
+    job_labels: Dict[str, str] = Field(
+        default_factory=lambda: {"bq_mcp_ext": "true"},
+        description="Configurable default job labels injected into QueryJobConfig.labels",
+    )
 
     @model_validator(mode="after")
     def _validate_row_limits(self) -> "BigQueryConfig":
@@ -105,6 +113,7 @@ class ToolsConfig(BaseModel):
     enable_bq_list_tables: bool = Field(default=True, description="Enable bq_list_tables tool")
     enable_bq_table_metadata: bool = Field(default=True, description="Enable bq_table_metadata tool")
     enable_bq_query_execution: bool = Field(default=True, description="Enable bq_query_execution tool")
+    enable_bq_search_metadata: bool = Field(default=True, description="Enable bq_search_metadata tool")
 
 
 class CacheConfig(BaseModel):
@@ -205,6 +214,23 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
     val = _safe_int("BIGQUERY_QUERY_TIMEOUT_SECONDS")
     if val is not None:
         data["bigquery"]["query_timeout_seconds"] = val
+    if "BIGQUERY_REQUEST_TAG_NAME" in os.environ:
+        data["bigquery"]["request_tag_name"] = os.environ["BIGQUERY_REQUEST_TAG_NAME"]
+    if "BIGQUERY_JOB_LABELS" in os.environ:
+        raw_labels = os.environ["BIGQUERY_JOB_LABELS"]
+        try:
+            import json
+            parsed = json.loads(raw_labels)
+            if isinstance(parsed, dict):
+                data["bigquery"]["job_labels"] = {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            parsed = {}
+            for pair in raw_labels.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    parsed[k.strip()] = v.strip()
+            if parsed:
+                data["bigquery"]["job_labels"] = parsed
 
     # Server overrides
     if "SERVER_HOST" in os.environ:
@@ -260,6 +286,8 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         data["tools"]["enable_bq_table_metadata"] = os.environ["ENABLE_BQ_TABLE_METADATA"].lower() in ("true", "1", "yes")
     if "ENABLE_BQ_QUERY_EXECUTION" in os.environ:
         data["tools"]["enable_bq_query_execution"] = os.environ["ENABLE_BQ_QUERY_EXECUTION"].lower() in ("true", "1", "yes")
+    if "ENABLE_BQ_SEARCH_METADATA" in os.environ:
+        data["tools"]["enable_bq_search_metadata"] = os.environ["ENABLE_BQ_SEARCH_METADATA"].lower() in ("true", "1", "yes")
 
     return data
 

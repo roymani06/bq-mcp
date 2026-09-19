@@ -27,6 +27,10 @@ bigquery:
   max_rows_returned: 200                 # Maximum rows serialized to prevent OOM
   max_bytes_billed: 10737418240          # 10 GB hard cost-ceiling per query
   query_timeout_seconds: 60
+  # BigQuery Request Tags & Job Labels
+  request_tag_name: "bq_mcp_ext"         # Tag name for tracking jobs in BigQuery
+  job_labels:                            # Configurable static job labels injected into BigQuery jobs
+    bq_mcp_ext: "true"
 
 # ==============================================================================
 # SQL Sanitizer (Enforce Read-Only Queries)
@@ -56,6 +60,7 @@ tools:
   enable_bq_list_tables: true
   enable_bq_table_metadata: true
   enable_bq_query_execution: true
+  enable_bq_search_metadata: true
 
 # ==============================================================================
 # In-Memory Metadata Caching (TTLCache)

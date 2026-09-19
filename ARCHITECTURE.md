@@ -81,7 +81,7 @@ flowchart TD
 ---
 
 ### 2.2. `src/tools.py` — Dynamic FastMCP Tool Registry & Error Shielding
-- **Purpose**: Defines the 4 public MCP tools exposed to AI models and coordinates error masking to prevent security leaks.
+- **Purpose**: Defines the 5 public MCP tools exposed to AI models and coordinates error masking to prevent security leaks.
 - **Key Components**:
   - `_sanitize_message(raw: str) -> str`:
     - Regex engine that scrubs Google Cloud internal REST endpoints (`https://bigquery.googleapis.com/...`), local credential filesystem paths, internal Job IDs, and server stack traces from error messages.
@@ -92,15 +92,16 @@ flowchart TD
     - Prevents sensitive credential parsing errors from being exposed to the AI client.
   - `build_mcp_server(settings, bq_manager) -> FastMCP`:
     - Config-driven tool registrar. Conditionally enables tools according to `config.tools` settings:
-      1. **`bq_list_datasets`**: Lists available BigQuery datasets in the target GCP project. (Cached with TTLCache).
-      2. **`bq_list_tables`**: Lists all tables, views, and materialized views inside a dataset. (Cached with TTLCache).
-      3. **`bq_table_metadata`**: Retrieves schema (column types, modes, descriptions), row count, byte size, partitioning, and clustering keys. (Cached with TTLCache).
-      4. **`bq_query_execution`**: Executes strictly read-only SQL with pagination, cost ceilings, and optional `dry_run` cost estimation.
+      1. **`bq_list_datasets`**: Lists available BigQuery datasets in the target GCP project using free REST API. (Cached with TTLCache).
+      2. **`bq_list_tables`**: Lists all tables, views, and materialized views inside a dataset using free REST API. (Cached with TTLCache).
+      3. **`bq_table_metadata`**: Retrieves schema (column types, modes, descriptions), row count, byte size, partitioning, and clustering keys via free REST API. (Cached with TTLCache).
+      4. **`bq_query_execution`**: Executes strictly read-only SQL with pagination, cost ceilings, job label injection (`bq_mcp_ext`), and optional `dry_run` cost estimation.
+      5. **`bq_search_metadata`**: Hybrid metadata search tool preferring free BigQuery REST APIs for table and dataset discovery ($0.00 / 0 query bytes), and reserving dataset-scoped `INFORMATION_SCHEMA` strictly for cross-table column search with minimal data scanning. (Cached with TTLCache).
 
 ---
 
 ### 2.3. `src/client.py` — BigQuery Backend Client & Guardrails Engine
-- **Purpose**: Directly interfaces with Google Cloud BigQuery, enforcing cost limits, SQL limit injection, row limits, and JSON data type serialization.
+- **Purpose**: Directly interfaces with Google Cloud BigQuery, enforcing cost limits, request tag injection, SQL limit injection, hybrid metadata queries, and JSON data type serialization.
 - **Key Components**:
   - `BigQueryClientManager`:
     - Thread-safe lazy-initialization of `google.cloud.bigquery.Client`.
@@ -108,13 +109,22 @@ flowchart TD
       1. Explicit path in `config.yaml` / `settings.auth.service_account_key_path` (e.g., `gcp-phoenix-dev.json`).
       2. `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
       3. Google Application Default Credentials (ADC) / Workload Identity Federation (for Cloud Run, GKE, Compute Engine).
-    - `list_datasets()`, `list_tables()`, `get_table_metadata()`: Metadata retrieval operations.
-    - `execute_query(query, dry_run, limit)`:
+    - **BigQuery Request Tags**:
+      - `build_job_labels(request_context, request_tag) -> Dict[str, str]`:
+        - Injects configurable job labels into `QueryJobConfig.labels` from `config.yaml` and request context.
+        - Manages request tag name via `config.request_tag_name` (default: `'bq_mcp_ext'`).
+        - Sanitizes keys and values to strictly satisfy GCP BigQuery requirements (`[a-z0-9_-]`, max 63 characters).
+    - **Hybrid Metadata Engine**:
+      - `list_datasets()`, `list_tables()`, `get_table_metadata()`: 100% free BigQuery REST APIs ($0.00 / 0 query bytes).
+      - `search_metadata(query, dataset_id, search_type, limit)`:
+        - **Free REST API Phase**: Discovers datasets and tables in memory via `list_datasets()` and `list_tables()` without executing any BigQuery SQL queries (0 bytes billed).
+        - **Scoped INFORMATION_SCHEMA Phase**: Strictly reserved for cross-table column search. Scopes directly to `{project}.{dataset}.INFORMATION_SCHEMA.COLUMNS` (never region/project-wide), projects only required columns (`table_catalog`, `table_schema`, `table_name`, `column_name`, `data_type`, `is_nullable`), pushes down parameterized filters, enforces SQL `LIMIT`, and injects job labels (`bq_mcp_ext`).
+    - `execute_query(query, dry_run, limit, request_context, request_tag)`:
       - Validates query against `SANITIZER`.
       - Resolves effective row limit based on hierarchy: explicit tool argument `limit` → query's `LIMIT` clause → `default_rows_returned` (capped at `max_rows_returned`).
       - Injects top-level `LIMIT <n>` server-side for live queries missing a limit to protect TB-scale tables from full-table materialization.
-      - Sets `QueryJobConfig(maximum_bytes_billed=..., dry_run=..., use_query_cache=True)`.
-      - Collects execution metrics (duration in ms, bytes billed, bytes processed, cache hit flag).
+      - Sets `QueryJobConfig(maximum_bytes_billed=..., dry_run=..., use_query_cache=True, labels=effective_labels)`.
+      - Collects execution metrics (duration in ms, bytes billed, bytes processed, cache hit flag, applied job labels).
   - `inject_sql_limit(query: str, limit_val: int) -> str`:
     - Uses `sqlglot` to parse BigQuery AST and append a `LIMIT <n>` clause safely to single-statement SELECT / UNION queries without corrupting comments or CTEs.
   - `extract_sql_limit(query: str) -> Optional[int]`:
