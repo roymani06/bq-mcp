@@ -1,0 +1,46 @@
+# ==============================================================================
+# GCP BigQuery MCP Server — .gitignore
+# ==============================================================================
+
+# GCP Service Account Credentials (NEVER commit these)
+*.json
+!package.json
+!tsconfig.json
+
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+sdist/
+
+# Pytest
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.env
